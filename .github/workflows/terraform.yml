@@ -2,7 +2,7 @@ name: Terraform Infrastructure
 
 # PR to main        → fmt + init + validate + plan (posts plan as PR comment)
 # Push/merge to main → init + plan + apply (fresh plan before every apply)
-# Manual dispatch    → target a specific environment and action
+# Manual dispatch    → plan, apply, or destroy dev environment
 
 on:
   push:
@@ -11,18 +11,16 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Target environment'
-        required: true
-        default: 'dev'
-        type: choice
-        options: [dev, qa, prod]
       action:
         description: 'Terraform action'
         required: true
         default: 'plan'
         type: choice
         options: [plan, apply, destroy]
+      confirm_destroy:
+        description: 'Type "destroy" to confirm destruction (required when action=destroy)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -42,10 +40,6 @@ jobs:
   terraform-dev:
     name: Terraform / Dev
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'push' ||
-      github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
     environment: ${{ github.ref == 'refs/heads/main' && 'dev' || '' }}
     defaults:
       run:
@@ -177,138 +171,12 @@ jobs:
       - name: Terraform Destroy
         if: |
           github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.environment == 'dev' &&
-          github.event.inputs.action == 'destroy'
+          github.event.inputs.action == 'destroy' &&
+          github.event.inputs.confirm_destroy == 'destroy'
         run: |
           terraform destroy \
             -var="db_password=${{ secrets.DEV_DB_PASSWORD }}" \
             -var="jwt_secret=${{ secrets.DEV_JWT_SECRET }}" \
-            -var="github_org=ravdy" \
-            -auto-approve \
-            -no-color
-
-  # ── QA (manual dispatch only) ─────────────────────────────────────────────
-  terraform-qa:
-    name: Terraform / QA
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.environment == 'qa'
-    environment: qa
-    defaults:
-      run:
-        working-directory: envs/qa
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Terraform Init
-        run: terraform init
-
-      - name: Terraform Validate
-        run: terraform validate -no-color
-
-      - name: Terraform Plan
-        id: plan
-        run: |
-          terraform plan \
-            -var="db_password=${{ secrets.QA_DB_PASSWORD }}" \
-            -var="jwt_secret=${{ secrets.QA_JWT_SECRET }}" \
-            -var="github_org=ravdy" \
-            -out=tfplan \
-            -no-color
-
-      - name: Terraform Apply
-        if: github.event.inputs.action == 'apply' && steps.plan.outcome == 'success'
-        run: |
-          terraform apply \
-            -var="db_password=${{ secrets.QA_DB_PASSWORD }}" \
-            -var="jwt_secret=${{ secrets.QA_JWT_SECRET }}" \
-            -var="github_org=ravdy" \
-            -auto-approve \
-            -no-color
-
-      - name: Terraform Destroy
-        if: github.event.inputs.action == 'destroy'
-        run: |
-          terraform destroy \
-            -var="db_password=${{ secrets.QA_DB_PASSWORD }}" \
-            -var="jwt_secret=${{ secrets.QA_JWT_SECRET }}" \
-            -var="github_org=ravdy" \
-            -auto-approve \
-            -no-color
-
-  # ── Prod (manual dispatch + approval gate) ────────────────────────────────
-  terraform-prod:
-    name: Terraform / Prod
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.environment == 'prod'
-    environment: prod   # ← protection rules on this environment require approval
-    defaults:
-      run:
-        working-directory: envs/prod
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Terraform Init
-        run: terraform init
-
-      - name: Terraform Validate
-        run: terraform validate -no-color
-
-      - name: Terraform Plan
-        id: plan
-        run: |
-          terraform plan \
-            -var="db_password=${{ secrets.PROD_DB_PASSWORD }}" \
-            -var="jwt_secret=${{ secrets.PROD_JWT_SECRET }}" \
-            -var="github_org=ravdy" \
-            -out=tfplan \
-            -no-color
-
-      - name: Terraform Apply
-        if: github.event.inputs.action == 'apply' && steps.plan.outcome == 'success'
-        run: |
-          terraform apply \
-            -var="db_password=${{ secrets.PROD_DB_PASSWORD }}" \
-            -var="jwt_secret=${{ secrets.PROD_JWT_SECRET }}" \
-            -var="github_org=ravdy" \
-            -auto-approve \
-            -no-color
-
-      - name: Terraform Destroy
-        if: github.event.inputs.action == 'destroy'
-        run: |
-          terraform destroy \
-            -var="db_password=${{ secrets.PROD_DB_PASSWORD }}" \
-            -var="jwt_secret=${{ secrets.PROD_JWT_SECRET }}" \
             -var="github_org=ravdy" \
             -auto-approve \
             -no-color
