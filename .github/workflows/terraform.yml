@@ -1,14 +1,20 @@
 name: Terraform Infrastructure
 
-# PR to main        → fmt + init + validate + plan (posts plan as PR comment)
-# Push/merge to main → init + plan + apply (fresh plan before every apply)
+# PR to main        → plan only (posts result as PR comment)
+# Push/merge to main → plan (auto) → approval gate → apply
 # Manual dispatch    → plan, apply, or destroy dev environment
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'envs/dev/**'
+      - 'modules/**'
   pull_request:
     branches: [main]
+    paths:
+      - 'envs/dev/**'
+      - 'modules/**'
   workflow_dispatch:
     inputs:
       action:
@@ -30,17 +36,16 @@ env:
   TF_VERSION: '1.10.0'
   AWS_REGION: us-east-1
 
-# Cancel any in-progress run on the same branch to avoid state conflicts
+# Prevent parallel runs on the same branch — avoids state conflicts
 concurrency:
   group: terraform-${{ github.ref }}
-  cancel-in-progress: false   # false = wait, don't cancel — safer for Terraform
+  cancel-in-progress: false   # wait, don't cancel — safer for Terraform
 
 jobs:
-  # ── Dev ───────────────────────────────────────────────────────────────────
-  terraform-dev:
-    name: Terraform / Dev
+  # ── Plan ──────────────────────────────────────────────────────────────────
+  plan:
+    name: Terraform Plan
     runs-on: ubuntu-latest
-    environment: ${{ github.ref == 'refs/heads/main' && 'dev' || '' }}
     defaults:
       run:
         working-directory: envs/dev
@@ -60,23 +65,19 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ── Format check ──────────────────────────────────────────────────────
       - name: Terraform Format Check
         id: fmt
         run: terraform fmt -check -recursive
-        continue-on-error: true   # report but don't block — fix separately
+        continue-on-error: true
 
-      # ── Init ──────────────────────────────────────────────────────────────
       - name: Terraform Init
         id: init
         run: terraform init
 
-      # ── Validate ──────────────────────────────────────────────────────────
       - name: Terraform Validate
         id: validate
         run: terraform validate -no-color
 
-      # ── Plan (runs on both PR and main push) ──────────────────────────────
       - name: Terraform Plan
         id: plan
         run: |
@@ -86,9 +87,8 @@ jobs:
             -var="github_org=ravdy" \
             -out=tfplan \
             -no-color 2>&1 | tee plan-output.txt
-        continue-on-error: true   # we post the result to PR even on failure
+        continue-on-error: true
 
-      # ── Post plan as PR comment ───────────────────────────────────────────
       - name: Post plan to PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
@@ -125,7 +125,6 @@ jobs:
 
             *Workflow: \`${{ github.workflow }}\` | Actor: \`${{ github.actor }}\` | Commit: \`${{ github.sha }}\`*`;
 
-            // Delete previous plan comments to keep PR clean
             const comments = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo:  context.repo.repo,
@@ -148,31 +147,92 @@ jobs:
               body,
             });
 
-      # ── Fail the job if plan failed (blocks PR merge via branch protection) ──
       - name: Check plan status
         if: steps.plan.outcome == 'failure'
         run: exit 1
 
-      # ── Apply — only on push to main, after a fresh successful plan ───────
+      - name: Upload plan file
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: envs/dev/tfplan
+          retention-days: 1
+
+  # ── Apply ─────────────────────────────────────────────────────────────────
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: dev   # ← pauses here and waits for manual approval
+    defaults:
+      run:
+        working-directory: envs/dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Download plan file
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: envs/dev
+
       - name: Terraform Apply
-        if: |
-          github.ref == 'refs/heads/main' &&
-          github.event_name == 'push' &&
-          steps.plan.outcome == 'success'
         run: |
           terraform apply \
-            -var="db_password=${{ secrets.DEV_DB_PASSWORD }}" \
-            -var="jwt_secret=${{ secrets.DEV_JWT_SECRET }}" \
-            -var="github_org=ravdy" \
             -auto-approve \
-            -no-color
+            -no-color \
+            tfplan
 
-      # ── Destroy — manual dispatch only ────────────────────────────────────
+  # ── Destroy ───────────────────────────────────────────────────────────────
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.action == 'destroy' &&
+      github.event.inputs.confirm_destroy == 'destroy'
+    environment: dev   # ← approval gate for destroy too
+    defaults:
+      run:
+        working-directory: envs/dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init
+
       - name: Terraform Destroy
-        if: |
-          github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.action == 'destroy' &&
-          github.event.inputs.confirm_destroy == 'destroy'
         run: |
           terraform destroy \
             -var="db_password=${{ secrets.DEV_DB_PASSWORD }}" \
